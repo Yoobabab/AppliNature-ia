@@ -1,0 +1,117 @@
+# Robot d'entraînement de l'IA d'AppliNature (dépôt public : robot illimité, 4 cœurs).
+# Il rassemble des photos libres de droits (GBIF), entraîne le modèle, vérifie
+# que le moteur de l'appli le lit exactement comme l'entraînement, puis publie
+# le modèle dans une « Release ». L'appli (dépôt privé) vient le chercher.
+name: Entraîner l'IA
+
+on:
+  workflow_dispatch:
+    inputs:
+      groupe:
+        description: Groupe d'espèces
+        type: choice
+        options: [champignons, arbres, fleurs, plantes]
+        default: champignons
+      especes:
+        description: Nombre d'espèces
+        default: '150'
+      par_espece:
+        description: Photos par espèce
+        default: '400'
+      alpha:
+        description: Taille du réseau (0.5 rapide, 0.75 plus juste mais ~2 fois plus lent)
+        type: choice
+        options: ['0.5', '0.75']
+        default: '0.75'
+      epoques_fines:
+        description: Nombre de tours d'affinage
+        default: '16'
+      minutes_collecte:
+        description: Temps maximum pour rassembler les photos (minutes)
+        default: '120'
+      minutes_entrainement:
+        description: Temps maximum d'entraînement (minutes)
+        default: '210'
+
+concurrency:
+  group: ia-${{ inputs.groupe }}
+  cancel-in-progress: false
+
+jobs:
+  entrainer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      contents: write
+    env:
+      G: ${{ inputs.groupe }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Installer TensorFlow
+        run: pip install --quiet tensorflow-cpu==2.21.0 pillow requests
+
+      - name: Reprendre les photos déjà téléchargées
+        uses: actions/cache/restore@v4
+        with:
+          path: donnees
+          key: ia-photos-${{ inputs.groupe }}-${{ inputs.especes }}-${{ inputs.par_espece }}-${{ github.run_id }}
+          restore-keys: |
+            ia-photos-${{ inputs.groupe }}-${{ inputs.especes }}-${{ inputs.par_espece }}-
+            ia-photos-${{ inputs.groupe }}-${{ inputs.especes }}-
+            ia-photos-${{ inputs.groupe }}-
+
+      - name: Rassembler les photos libres
+        run: |
+          set -o pipefail
+          python outils/ia/collecter.py "$G" --dossier donnees --especes "${{ inputs.especes }}" --par-espece "${{ inputs.par_espece }}" --limite-minutes "${{ inputs.minutes_collecte }}" 2>&1 | tee -a journal.txt
+
+      - name: Garder les photos pour la prochaine fois
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: donnees
+          key: ia-photos-${{ inputs.groupe }}-${{ inputs.especes }}-${{ inputs.par_espece }}-${{ github.run_id }}
+
+      - name: Entraîner
+        env:
+          IA_ALPHA: ${{ inputs.alpha }}
+        run: |
+          set -o pipefail
+          mkdir -p sortie
+          python outils/ia/entrainer.py "$G" --dossier donnees --sortie sortie --reference "sortie/ia-$G.json" --epoques-fines "${{ inputs.epoques_fines }}" --limite-minutes "${{ inputs.minutes_entrainement }}" 2>&1 | grep -v -E "^(I0000|W0000)|oneDNN|cpu_feature_guard|To enable the following" | tee -a journal.txt
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Vérifier que l'appli lit le modèle comme l'entraînement
+        run: node --experimental-strip-types outils/ia/verifier.ts "sortie/$G.an1" "sortie/ia-$G.json" 2>&1 | tee -a journal.txt
+
+      - name: Publier le modèle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "donnees/$G/credits.csv" "sortie/credits-$G.csv"
+          cp "donnees/$G/especes.json" "sortie/especes-$G.json"
+          TAG="$G-$(date +%Y%m%d-%H%M)"
+          grep -h "^Résultat" journal.txt | tail -1 > notes.txt || true
+          echo "alpha ${{ inputs.alpha }}, ${{ inputs.par_espece }} photos par espèce, ${{ inputs.epoques_fines }} tours d'affinage" >> notes.txt
+          gh release create "$TAG" "sortie/$G.an1" "sortie/ia-$G.json" "sortie/credits-$G.csv" "sortie/especes-$G.json" --title "IA $G ($(date +%F))" --notes-file notes.txt
+
+      - name: Résumé du journal
+        if: always()
+        run: |
+          touch journal.txt
+          python3 - <<'PY'
+          lignes = [l.rstrip() for l in open('journal.txt', errors='replace')]
+          garde = [l for l in lignes if l.startswith(('  -', '  !', 'Temps', 'Résultat', 'Modèle', 'Terminé', 'Traceback', 'Epoch', 'Vérification')) or 'Error' in l or 'espèces' in l or 'top1' in l]
+          t = '\n'.join(garde[-120:] + ['--- fin du journal ---'] + lignes[-40:])
+          for i in range(0, min(len(t), 45000), 3000):
+              m = t[i:i+3000].replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+              print(f"::notice title=Journal {i // 3000 + 1:02d}::{m}")
+          PY
