@@ -156,14 +156,30 @@ jobs:
           [ "$MIEUX" = "1" ] && TITRE="$TITRE ★ meilleur"
           gh release create "$TAG" "sortie/$G.an1" "sortie/ia-$G.json" "sortie/credits-$G.csv" "sortie/especes-$G.json" --title "$TITRE" --notes-file notes.txt
           echo "Publié : $TAG, 3 premières $TOP3 (avant $AVANT)" | tee -a journal.txt
-          # Nouvelle boucle avec plus de photos, tant que l'objectif n'est pas atteint.
-          SUITE=$(python3 -c "print(1 if $TOP3 < ${{ inputs.cible }} and ${{ inputs.tours }} > 1 else 0)")
-          PLUS=$(python3 -c "print(min(${{ inputs.maximum }}, ${{ inputs.par_espece }} + ${{ inputs.ajout }}))")
-          if [ "$SUITE" = "1" ]; then
-            echo "Objectif pas atteint : nouvelle boucle avec $PLUS photos par espèce." | tee -a journal.txt
-            gh workflow run entrainer.yml --ref main -f groupe="$G" -f especes="${{ inputs.especes }}" -f par_espece="$PLUS" -f alpha="${{ inputs.alpha }}" \
-              -f epoques_fines="${{ inputs.epoques_fines }}" -f figer="${{ inputs.figer }}" -f tours="$(( ${{ inputs.tours }} - 1 ))" -f cible="${{ inputs.cible }}" \
-              -f ajout="${{ inputs.ajout }}" -f maximum="${{ inputs.maximum }}"
+          # Nouvelle boucle tant que l'objectif n'est pas atteint : d'abord plus de photos par espèce,
+          # puis, quand on est au maximum de photos, une IA plus grosse (alpha 1.0).
+          # L'objectif peut être relevé dans objectif.txt (sans toucher aux boucles déjà lancées).
+          CIBLE=$(python3 -c "import os;print(max(${{ inputs.cible }}, float(open('objectif.txt').read()) if os.path.exists('objectif.txt') else 0))")
+          PAR=${{ inputs.par_espece }}; ALPHA=${{ inputs.alpha }}; TOURS=${{ inputs.tours }}
+          PLUS=$(python3 -c "print(min(${{ inputs.maximum }}, $PAR + ${{ inputs.ajout }}))")
+          if python3 -c "import sys;sys.exit(0 if $TOP3 < $CIBLE else 1)"; then
+            if [ "$TOURS" -gt 1 ] && [ "$PLUS" -gt "$PAR" ]; then
+              echo "Objectif $CIBLE pas atteint : nouvelle boucle avec $PLUS photos par espèce." | tee -a journal.txt
+              NPAR=$PLUS; NALPHA=$ALPHA; NTOURS=$(( TOURS - 1 ))
+            elif [ "$ALPHA" != "1.0" ]; then
+              echo "Objectif $CIBLE pas atteint et photos au maximum : nouvelle boucle avec une IA plus grosse (alpha 1.0)." | tee -a journal.txt
+              NPAR=$PAR; NALPHA=1.0; NTOURS=1
+            else
+              echo "Objectif $CIBLE pas atteint, mais plus rien à augmenter : fin des boucles." | tee -a journal.txt
+              NPAR=""
+            fi
+            if [ -n "$NPAR" ]; then
+              gh workflow run entrainer.yml --ref main -f groupe="$G" -f especes="${{ inputs.especes }}" -f par_espece="$NPAR" -f alpha="$NALPHA" \
+                -f epoques_fines="${{ inputs.epoques_fines }}" -f figer="${{ inputs.figer }}" -f tours="$NTOURS" -f cible="$CIBLE" \
+                -f ajout="${{ inputs.ajout }}" -f maximum="${{ inputs.maximum }}"
+            fi
+          else
+            echo "Objectif $CIBLE atteint : fin des boucles." | tee -a journal.txt
           fi
 
       - name: Résumé du journal
