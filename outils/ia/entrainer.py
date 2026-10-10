@@ -312,7 +312,8 @@ def main():
     if a.epoques_fines > 0:
         # 2) On affine la fin du réseau, doucement.
         base.trainable = True
-        for c in base.layers[: int(len(base.layers) * 0.4)]:
+        # On fige le début du réseau (formes simples, déjà bien apprises) : IA_FIGER = part figée.
+        for c in base.layers[: int(len(base.layers) * float(os.environ.get('IA_FIGER', '0.4')))]:
             c.trainable = False
         for c in base.layers:
             if isinstance(c, keras.layers.BatchNormalization):

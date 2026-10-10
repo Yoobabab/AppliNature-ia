@@ -17,7 +17,10 @@ import csv
 import io
 import json
 import os
+import glob
+import hashlib
 import random
+import re
 import sys
 import time
 import urllib.parse
@@ -122,13 +125,14 @@ def photos_espece(cle, n, exclure=()):
     """Liste (url, auteur, licence, occurrence) de photos libres, en Europe."""
     out = []
     vus = set()
-    for licence in ("CC0_1_0", "CC_BY_4_0"):
+    # D'abord les photos prises en Europe, puis (s'il en manque) celles du reste du monde.
+    for continent, licence in (("EUROPE", "CC0_1_0"), ("EUROPE", "CC_BY_4_0"), (None, "CC0_1_0"), (None, "CC_BY_4_0")):
         offset = 0
-        while len(out) < n * 1.4 and offset < 1200:
-            r = get(
-                f"{API}/occurrence/search",
-                {"taxonKey": cle, "mediaType": "StillImage", "license": licence, "continent": "EUROPE", "limit": 300, "offset": offset},
-            )
+        while len(out) < n * 1.4 and offset < 1500:
+            params = {"taxonKey": cle, "mediaType": "StillImage", "license": licence, "limit": 300, "offset": offset}
+            if continent:
+                params["continent"] = continent
+            r = get(f"{API}/occurrence/search", params)
             for occ in r.get("results", []):
                 if occ.get("taxonKey") in exclure:
                     continue
@@ -152,9 +156,20 @@ def photos_espece(cle, n, exclure=()):
     return out
 
 
+def nom_fichier(p):
+    """Nom stable d'une photo (ne dépend pas de l'ordre de la liste) : occurrence + empreinte de l'adresse."""
+    return f"{p['occurrence']}-{hashlib.md5(p['url'].encode()).hexdigest()[:8]}.jpg"
+
+
 def telecharger(p, chemin):
     if os.path.exists(chemin):
         return True
+    # Ancien nommage (« occurrence-numéro.jpg ») : on reprend la photo déjà téléchargée.
+    dossier = os.path.dirname(chemin)
+    for ancien in glob.glob(os.path.join(dossier, f"{p['occurrence']}-[0-9]*.jpg")):
+        if re.fullmatch(r"\d+-\d+\.jpg", os.path.basename(ancien)):
+            os.rename(ancien, chemin)
+            return True
     for i in range(3):
         try:
             r = S.get(p["url"], timeout=30)
@@ -222,7 +237,7 @@ def main():
             return None
         dossier = os.path.join(racine, str(cle))
         os.makedirs(dossier, exist_ok=True)
-        futurs = {pool.submit(telecharger, p, os.path.join(dossier, f"{p['occurrence']}-{i}.jpg")): (i, p) for i, p in enumerate(photos)}
+        futurs = {pool.submit(telecharger, p, os.path.join(dossier, nom_fichier(p))): (i, p) for i, p in enumerate(photos)}
         ok = []
         for f in cf.as_completed(futurs):
             i, p = futurs[f]
@@ -231,7 +246,7 @@ def main():
         ok.sort(key=lambda x: x[0])
         # On garde au plus « par-espece » photos.
         for i, p in ok[a.par_espece :]:
-            os.remove(os.path.join(dossier, f"{p['occurrence']}-{i}.jpg"))
+            os.remove(os.path.join(dossier, nom_fichier(p)))
         ok = ok[: a.par_espece]
         if len(ok) < a.min_photos:
             print(f"  - {info.get('canonicalName')} : {len(ok)} photos téléchargées, ignorée", flush=True)
@@ -252,7 +267,8 @@ def main():
             if r and len(especes) < a.especes:
                 especes.append(r[0])
                 credits.extend(r[1])
-    print(f"{len(especes)} espèces prêtes en {(time.time() - debut) / 60:.0f} min", flush=True)
+    complet = (time.time() - debut) / 60 <= a.limite_minutes
+    print(f"{len(especes)} espèces prêtes en {(time.time() - debut) / 60:.0f} min{'' if complet else ' (temps écoulé : collecte à reprendre)'}", flush=True)
 
     if g.get("autre"):
         # « Autre » : d'autres êtres vivants, pour apprendre « ce n'est pas un champignon / un arbre… ».
@@ -283,6 +299,8 @@ def main():
         w = csv.writer(f)
         w.writerow(["groupe", "espece", "auteur", "licence", "source"])
         w.writerows(credits)
+    with open(os.path.join(racine, "etat.json"), "w") as f:
+        json.dump({"complet": complet, "especes": len(especes), "par_espece": a.par_espece}, f)
     print(f"Terminé : {len(especes)} espèces, {len(credits)} photos.")
     if len(especes) < 10:
         sys.exit("Trop peu d'espèces : quelque chose ne va pas.")
