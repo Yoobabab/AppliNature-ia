@@ -227,6 +227,21 @@ def main():
 
     def preparer(cle, nb_fr):
         """Prépare une espèce : ses photos libres, téléchargées. None si pas assez."""
+        dossier = os.path.join(racine, str(cle))
+        memo = os.path.join(dossier, "fiche.json")
+        # Déjà préparée lors d'un passage précédent (assez de photos, ou GBIF n'en a pas plus) : on reprend
+        # sans réinterroger GBIF. Sans ça, chaque passage refaisait tout et la collecte n'avançait plus.
+        if os.path.exists(memo):
+            try:
+                m = json.load(open(memo, encoding="utf-8"))
+                assez = m["demande"] >= a.par_espece or m["trouvees"] < m["demande"]
+                if assez and m.get("fiche") is None:
+                    return None
+                if assez and len(glob.glob(os.path.join(dossier, "*.jpg"))) >= m["fiche"]["photos"]:
+                    m["fiche"]["obsFrance"] = nb_fr
+                    return m["fiche"], m["lignes"]
+            except Exception:
+                pass
         if (time.time() - debut) / 60 > a.limite_minutes:
             return None
         info = get(f"{API}/species/{cle}")
@@ -238,11 +253,16 @@ def main():
         # Une même photo peut apparaître deux fois (même occurrence, même adresse) : une seule fois.
         vus = set()
         photos = [p for p in photos if not (nom_fichier(p) in vus or vus.add(nom_fichier(p)))]
+        os.makedirs(dossier, exist_ok=True)
+
+        def retenir(fiche, lignes=None):
+            with open(memo, "w", encoding="utf-8") as f:
+                json.dump({"demande": a.par_espece, "trouvees": len(photos), "fiche": fiche, "lignes": lignes}, f, ensure_ascii=False)
+
         if len(photos) < a.min_photos:
             print(f"  - {info.get('canonicalName')} : seulement {len(photos)} photos libres, ignorée", flush=True)
+            retenir(None)
             return None
-        dossier = os.path.join(racine, str(cle))
-        os.makedirs(dossier, exist_ok=True)
         futurs = {pool.submit(telecharger, p, os.path.join(dossier, nom_fichier(p))): (i, p) for i, p in enumerate(photos)}
         ok = []
         for f in cf.as_completed(futurs):
@@ -264,6 +284,7 @@ def main():
         fiche = {"key": cle, "latin": info.get("canonicalName"), "nom": nom, "genre": info.get("genus"), "famille": info.get("family"), "photos": len(ok), "obsFrance": nb_fr}
         lignes = [[a.groupe, info.get("canonicalName"), p["auteur"], p["licence"], f"https://www.gbif.org/occurrence/{p['occurrence']}"] for i, p in ok]
         print(f"  ✓ {info.get('canonicalName')} ({nom or '—'}) : {len(ok)} photos [{(time.time() - debut) / 60:.0f} min]", flush=True)
+        retenir(fiche, lignes)
         return fiche, lignes
 
     # Plusieurs espèces à la fois (l'attente des serveurs domine), dans l'ordre de popularité.

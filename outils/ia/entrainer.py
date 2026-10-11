@@ -269,16 +269,58 @@ def reference(modele, liste, n, chemin):
     json.dump({"taille": TAILLE, "images": out}, open(chemin, "w"))
 
 
-class Chrono(keras.callbacks.Callback):
-    """Arrête l'entraînement quand le temps alloué est dépassé (le robot a 6 h en tout)."""
+class Decalage(keras.optimizers.schedules.LearningRateSchedule):
+    """Le pas d'apprentissage en cosinus, qui continue là où le passage précédent s'était arrêté."""
 
-    def __init__(self, t0, minutes):
+    def __init__(self, cosinus, decalage):
+        self.cosinus, self.decalage = cosinus, decalage
+
+    def __call__(self, step):
+        return self.cosinus(step + self.decalage)
+
+    def get_config(self):
+        return {"decalage": self.decalage}
+
+
+class Suivi(keras.callbacks.Callback):
+    """Garde le meilleur modèle, arrête si ça ne progresse plus (5 tours), et, quand le temps du robot
+    (6 h en tout) va manquer, met l'entraînement de côté pour le passage suivant (--reprise)."""
+
+    def __init__(self, t0, minutes, reprise, etat):
         super().__init__()
-        self.t0, self.minutes = t0, minutes
+        self.t0, self.minutes, self.reprise, self.etat = t0, minutes, reprise, etat
+        self.debut_tour = time.time()
+        self.a_suivre = False
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.debut_tour = time.time()
 
     def on_epoch_end(self, epoch, logs=None):
-        if (time.time() - self.t0) / 60 > self.minutes:
-            print("Temps d'entraînement écoulé : on garde le meilleur modèle.", flush=True)
+        e = self.etat
+        v = float((logs or {}).get("val_top1", 0))
+        if v > e["meilleur"]:
+            e["meilleur"], e["attente"] = v, 0
+            if self.reprise:
+                self.model.save_weights(os.path.join(self.reprise, "meilleurs.weights.h5"))
+            else:
+                self.meilleurs = self.model.get_weights()
+        else:
+            e["attente"] += 1
+        e["epoque"] = epoch + 1
+        if self.reprise:
+            self.model.save_weights(os.path.join(self.reprise, "poids.weights.h5"))
+            json.dump(e, open(os.path.join(self.reprise, "etat.json"), "w"))
+        if e["attente"] >= 5:
+            print("Plus de progrès depuis 5 tours : on s'arrête.", flush=True)
+            self.model.stop_training = True
+            return
+        duree = (time.time() - self.debut_tour) / 60
+        if (time.time() - self.t0) / 60 + duree * 1.1 > self.minutes and e["epoque"] < e["total"]:
+            if self.reprise:
+                print(f"Temps du passage écoulé après {e['epoque']}/{e['total']} tours : suite au prochain passage.", flush=True)
+                self.a_suivre = True
+            else:
+                print("Temps d'entraînement écoulé : on garde le meilleur modèle.", flush=True)
             self.model.stop_training = True
 
 
@@ -292,6 +334,7 @@ def main():
     ap.add_argument("--epoques-fines", type=int, default=24)
     ap.add_argument("--sans-poids", action="store_true")
     ap.add_argument("--limite-minutes", type=float, default=150, help="on arrête d'affiner au-delà (le meilleur modèle est gardé)")
+    ap.add_argument("--reprise", help="dossier où l'entraînement est mis de côté entre deux passages du robot")
     a = ap.parse_args()
     tf.keras.utils.set_random_seed(1)
 
@@ -304,11 +347,27 @@ def main():
     d_entr, d_val = jeu(entr, True, len(classes)), jeu(valid, False, len(classes))
     t0 = time.time()
 
-    if a.epoques > 0:
+    etat = {"epoque": 0, "total": a.epoques_fines, "meilleur": -1.0, "attente": 0}
+    if a.reprise:
+        os.makedirs(a.reprise, exist_ok=True)
+        if os.path.exists(os.path.join(a.reprise, "a_suivre")):
+            os.remove(os.path.join(a.reprise, "a_suivre"))
+        try:
+            prec = json.load(open(os.path.join(a.reprise, "etat.json")))
+            if prec.get("total") == a.epoques_fines and len(prec.get("classes", [])) == len(classes):
+                etat = prec
+                print(f"Reprise de l'entraînement au tour {etat['epoque'] + 1}/{etat['total']} (meilleur : {etat['meilleur']:.4f}).", flush=True)
+        except Exception:
+            pass
+        etat["classes"] = [c["key"] for c in classes]
+    reprend = etat["epoque"] > 0
+
+    if a.epoques > 0 and not reprend:
         # 1) On n'apprend que la dernière couche (le reste garde ce qu'il sait déjà voir).
         base.trainable = False
         modele.compile(optimizer=keras.optimizers.Adam(1e-3), loss=perte, metrics=metriques)
         modele.fit(d_entr, validation_data=d_val, epochs=a.epoques, verbose=2)
+    a_suivre = False
     if a.epoques_fines > 0:
         # 2) On affine la fin du réseau, doucement.
         base.trainable = True
@@ -319,15 +378,23 @@ def main():
             if isinstance(c, keras.layers.BatchNormalization):
                 c.trainable = False
         # Pas d'apprentissage qui décroît doucement (cosinus) : grands pas au début, petits à la fin.
-        pas = keras.optimizers.schedules.CosineDecay(2e-4, decay_steps=a.epoques_fines * len(d_entr), alpha=0.05)
-        modele.compile(optimizer=keras.optimizers.Adam(pas), loss=perte, metrics=metriques)
-        modele.fit(
-            d_entr,
-            validation_data=d_val,
-            epochs=a.epoques_fines,
-            verbose=2,
-            callbacks=[keras.callbacks.EarlyStopping(monitor="val_top1", patience=5, mode="max", restore_best_weights=True), Chrono(t0, a.limite_minutes)],
-        )
+        cosinus = keras.optimizers.schedules.CosineDecay(2e-4, decay_steps=a.epoques_fines * len(d_entr), alpha=0.05)
+        modele.compile(optimizer=keras.optimizers.Adam(Decalage(cosinus, etat["epoque"] * len(d_entr))), loss=perte, metrics=metriques)
+        if reprend:
+            modele.load_weights(os.path.join(a.reprise, "poids.weights.h5"))
+        suivi = Suivi(t0, a.limite_minutes, a.reprise, etat)
+        if etat["epoque"] < a.epoques_fines and etat["attente"] < 5:
+            modele.fit(d_entr, validation_data=d_val, initial_epoch=etat["epoque"], epochs=a.epoques_fines, verbose=2, callbacks=[suivi])
+        a_suivre = suivi.a_suivre
+        if a_suivre:
+            open(os.path.join(a.reprise, "a_suivre"), "w").write("1")
+            print("Entraînement mis de côté.", flush=True)
+            return 0
+        # On garde le meilleur tour.
+        if a.reprise and os.path.exists(os.path.join(a.reprise, "meilleurs.weights.h5")):
+            modele.load_weights(os.path.join(a.reprise, "meilleurs.weights.h5"))
+        elif getattr(suivi, "meilleurs", None) is not None:
+            modele.set_weights(suivi.meilleurs)
 
     res = modele.evaluate(d_val, verbose=0, return_dict=True) if valid else {}
     infos = {

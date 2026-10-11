@@ -58,6 +58,7 @@ jobs:
       G: ${{ inputs.groupe }}
       GH_TOKEN: ${{ github.token }}
       CLE: ia-photos-${{ inputs.groupe }}-${{ inputs.especes }}-${{ inputs.par_espece }}-${{ github.run_id }}
+      REPRISE: ia-reprise-${{ inputs.groupe }}-${{ inputs.especes }}-${{ inputs.par_espece }}-${{ inputs.alpha }}-${{ inputs.epoques_fines }}
     steps:
       - uses: actions/checkout@v5
 
@@ -108,7 +109,8 @@ jobs:
         run: |
           RESTE=$(( 340 - ( $(date +%s) - DEBUT ) / 60 ))
           echo "Minutes restantes : $RESTE" | tee -a journal.txt
-          if [ "$COMPLET" != "1" ] || [ "$RESTE" -lt 150 ]; then echo "RELANCE=1" >> "$GITHUB_ENV"; else echo "RELANCE=0" >> "$GITHUB_ENV"; fi
+          # L'entraînement peut s'étaler sur plusieurs passages (il est mis de côté entre deux) : 60 min suffisent pour avancer.
+          if [ "$COMPLET" != "1" ] || [ "$RESTE" -lt 60 ]; then echo "RELANCE=1" >> "$GITHUB_ENV"; else echo "RELANCE=0" >> "$GITHUB_ENV"; fi
           echo "MINUTES_ENTRAINEMENT=$(( RESTE - 25 ))" >> "$GITHUB_ENV"
 
       - name: Relancer un passage de collecte
@@ -119,6 +121,15 @@ jobs:
             -f epoques_fines="${{ inputs.epoques_fines }}" -f figer="${{ inputs.figer }}" -f tours="${{ inputs.tours }}" -f cible="${{ inputs.cible }}" \
             -f ajout="${{ inputs.ajout }}" -f maximum="${{ inputs.maximum }}"
 
+      - name: Reprendre l'entraînement mis de côté
+        if: env.RELANCE == '0'
+        uses: actions/cache/restore@v4
+        with:
+          path: reprise
+          key: ${{ env.REPRISE }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.REPRISE }}-
+
       - name: Entraîner
         if: env.RELANCE == '0'
         env:
@@ -127,19 +138,44 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p sortie
-          python outils/ia/entrainer.py "$G" --dossier donnees --sortie sortie --reference "sortie/ia-$G.json" --epoques-fines "${{ inputs.epoques_fines }}" --limite-minutes "$MINUTES_ENTRAINEMENT" 2>&1 | grep -v -E "^(I0000|W0000)|oneDNN|cpu_feature_guard|To enable the following" | tee -a journal.txt
+          python outils/ia/entrainer.py "$G" --dossier donnees --sortie sortie --reference "sortie/ia-$G.json" --epoques-fines "${{ inputs.epoques_fines }}" --limite-minutes "$MINUTES_ENTRAINEMENT" --reprise reprise 2>&1 | grep -v -E "^(I0000|W0000)|oneDNN|cpu_feature_guard|To enable the following" | tee -a journal.txt
+          if [ -f reprise/a_suivre ]; then echo "SUITE=1" >> "$GITHUB_ENV"; else echo "SUITE=0" >> "$GITHUB_ENV"; fi
+
+      - name: Mettre l'entraînement de côté
+        if: env.RELANCE == '0' && env.SUITE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: reprise
+          key: ${{ env.REPRISE }}-${{ github.run_id }}
+
+      # Garder seulement la dernière copie de l'entraînement en cours (ou aucune s'il est fini).
+      - name: Ranger les entraînements mis de côté
+        if: env.RELANCE == '0'
+        run: |
+          GARDE=""; [ "$SUITE" = "1" ] && GARDE="$REPRISE-${{ github.run_id }}"
+          gh api "repos/${{ github.repository }}/actions/caches?key=ia-reprise-$G-&per_page=100" --jq '.actions_caches[].key' | while read -r k; do
+            [ "$k" != "$GARDE" ] && gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=$k" >/dev/null && echo "effacé : $k"
+          done || true
+
+      - name: Poursuivre l'entraînement au prochain passage
+        if: env.RELANCE == '0' && env.SUITE == '1'
+        run: |
+          echo "Entraînement à poursuivre : nouveau passage." | tee -a journal.txt
+          gh workflow run entrainer.yml --ref main -f groupe="$G" -f especes="${{ inputs.especes }}" -f par_espece="${{ inputs.par_espece }}" -f alpha="${{ inputs.alpha }}" \
+            -f epoques_fines="${{ inputs.epoques_fines }}" -f figer="${{ inputs.figer }}" -f tours="${{ inputs.tours }}" -f cible="${{ inputs.cible }}" \
+            -f ajout="${{ inputs.ajout }}" -f maximum="${{ inputs.maximum }}"
 
       - uses: actions/setup-node@v6
-        if: env.RELANCE == '0'
+        if: env.RELANCE == '0' && env.SUITE == '0'
         with:
           node-version: 22
 
       - name: Vérifier que l'appli lit le modèle comme l'entraînement
-        if: env.RELANCE == '0'
+        if: env.RELANCE == '0' && env.SUITE == '0'
         run: node --experimental-strip-types outils/ia/verifier.ts "sortie/$G.an1" "sortie/ia-$G.json" 2>&1 | tee -a journal.txt
 
       - name: Publier le modèle et décider d'une nouvelle boucle
-        if: env.RELANCE == '0'
+        if: env.RELANCE == '0' && env.SUITE == '0'
         run: |
           cp "donnees/$G/credits.csv" "sortie/credits-$G.csv"
           cp "donnees/$G/especes.json" "sortie/especes-$G.json"
@@ -188,7 +224,7 @@ jobs:
           touch journal.txt
           python3 - <<'PY'
           lignes = [l.rstrip() for l in open('journal.txt', errors='replace')]
-          garde = [l for l in lignes if l.startswith(('  -', '  !', 'Temps', 'Résultat', 'Modèle', 'Terminé', 'Traceback', 'Epoch', 'Vérification', 'Publié', 'Objectif', 'Collecte', 'Minutes')) or 'Error' in l or 'espèces' in l or 'top1' in l]
+          garde = [l for l in lignes if l.startswith(('  -', '  !', 'Temps', 'Résultat', 'Modèle', 'Terminé', 'Traceback', 'Epoch', 'Vérification', 'Publié', 'Objectif', 'Collecte', 'Minutes', 'Entraînement', 'Reprise', 'Plus de progrès')) or 'Error' in l or 'espèces' in l or 'top1' in l]
           t = '\n'.join(garde[-120:] + ['--- fin du journal ---'] + lignes[-40:])
           for i in range(0, min(len(t), 45000), 3000):
               m = t[i:i+3000].replace('%', '%25').replace('\r', '').replace('\n', '%0A')
