@@ -297,7 +297,8 @@ def main():
             if r and len(especes) < a.especes:
                 especes.append(r[0])
                 credits.extend(r[1])
-    complet = (time.time() - debut) / 60 <= a.limite_minutes
+    # Fini si toutes les espèces voulues sont prêtes, ou si toute la liste a été parcourue dans le temps.
+    complet = len(especes) >= a.especes or (time.time() - debut) / 60 <= a.limite_minutes
     print(f"{len(especes)} espèces prêtes en {(time.time() - debut) / 60:.0f} min{'' if complet else ' (temps écoulé : collecte à reprendre)'}", flush=True)
 
     if g.get("autre"):
