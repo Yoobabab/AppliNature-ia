@@ -168,8 +168,11 @@ def telecharger(p, chemin):
     dossier = os.path.dirname(chemin)
     for ancien in glob.glob(os.path.join(dossier, f"{p['occurrence']}-[0-9]*.jpg")):
         if re.fullmatch(r"\d+-\d+\.jpg", os.path.basename(ancien)):
-            os.rename(ancien, chemin)
-            return True
+            try:
+                os.rename(ancien, chemin)
+                return True
+            except OSError:  # déjà repris par un autre téléchargement
+                break
     for i in range(3):
         try:
             r = S.get(p["url"], timeout=30)
@@ -232,6 +235,9 @@ def main():
         if info.get("genus") in g.get("exclure_genres", []) or info.get("family") in g.get("exclure_familles", []):
             return None
         photos = photos_espece(cle, a.par_espece)
+        # Une même photo peut apparaître deux fois (même occurrence, même adresse) : une seule fois.
+        vus = set()
+        photos = [p for p in photos if not (nom_fichier(p) in vus or vus.add(nom_fichier(p)))]
         if len(photos) < a.min_photos:
             print(f"  - {info.get('canonicalName')} : seulement {len(photos)} photos libres, ignorée", flush=True)
             return None
@@ -246,7 +252,10 @@ def main():
         ok.sort(key=lambda x: x[0])
         # On garde au plus « par-espece » photos.
         for i, p in ok[a.par_espece :]:
-            os.remove(os.path.join(dossier, nom_fichier(p)))
+            try:
+                os.remove(os.path.join(dossier, nom_fichier(p)))
+            except OSError:
+                pass
         ok = ok[: a.par_espece]
         if len(ok) < a.min_photos:
             print(f"  - {info.get('canonicalName')} : {len(ok)} photos téléchargées, ignorée", flush=True)
