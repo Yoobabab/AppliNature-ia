@@ -218,6 +218,8 @@ def main():
     pool = cf.ThreadPoolExecutor(32)  # téléchargements
     debut = time.time()
 
+    compte = {"reprises": 0, "nouvelles": 0}
+
     def traiter(cle, nb_fr):
         try:
             return preparer(cle, nb_fr)
@@ -236,12 +238,15 @@ def main():
                 m = json.load(open(memo, encoding="utf-8"))
                 assez = m["demande"] >= a.par_espece or m["trouvees"] < m["demande"]
                 if assez and m.get("fiche") is None:
+                    compte["reprises"] += 1
                     return None
                 if assez and len(glob.glob(os.path.join(dossier, "*.jpg"))) >= m["fiche"]["photos"]:
                     m["fiche"]["obsFrance"] = nb_fr
+                    compte["reprises"] += 1
                     return m["fiche"], m["lignes"]
             except Exception:
                 pass
+        compte["nouvelles"] += 1
         if (time.time() - debut) / 60 > a.limite_minutes:
             return None
         info = get(f"{API}/species/{cle}")
@@ -299,6 +304,7 @@ def main():
                 credits.extend(r[1])
     # Fini si toutes les espèces voulues sont prêtes, ou si toute la liste a été parcourue dans le temps.
     complet = len(especes) >= a.especes or (time.time() - debut) / 60 <= a.limite_minutes
+    print(f"Espèces reprises telles quelles : {compte['reprises']}, à (re)préparer : {compte['nouvelles']}", flush=True)
     print(f"{len(especes)} espèces prêtes en {(time.time() - debut) / 60:.0f} min{'' if complet else ' (temps écoulé : collecte à reprendre)'}", flush=True)
 
     if g.get("autre"):
@@ -322,7 +328,7 @@ def main():
         for (i, p), r_ in zip(enumerate(photos), res):
             if r_:
                 credits.append([a.groupe, "autre", p["auteur"], p["licence"], f"https://www.gbif.org/occurrence/{p['occurrence']}"])
-        print(f"  ✓ autre : {sum(res)} photos", flush=True)
+        print(f"  ✓ autre : {sum(res)} photos [{(time.time() - debut) / 60:.0f} min]", flush=True)
 
     with open(os.path.join(racine, "especes.json"), "w", encoding="utf-8") as f:
         json.dump(especes, f, ensure_ascii=False, indent=1)

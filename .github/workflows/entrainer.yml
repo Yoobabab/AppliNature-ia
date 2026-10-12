@@ -84,7 +84,7 @@ jobs:
       - name: Rassembler les photos libres
         run: |
           set -o pipefail
-          du -sh donnees 2>/dev/null || true
+          echo "Repris du cache : $(du -sh donnees 2>/dev/null | cut -f1) de photos, $(find donnees -name fiche.json 2>/dev/null | wc -l) espèces déjà notées" | tee -a journal.txt
           python outils/ia/collecter.py "$G" --dossier donnees --especes "${{ inputs.especes }}" --par-espece "${{ inputs.par_espece }}" --limite-minutes 200 2>&1 | tee -a journal.txt
           du -sh donnees | tee -a journal.txt
           python3 -c "import json;e=json.load(open('donnees/$G/etat.json'));print('COMPLET=' + ('1' if e['complet'] else '0'))" >> "$GITHUB_ENV"
@@ -100,7 +100,10 @@ jobs:
       - name: Effacer les anciennes copies des photos
         if: always()
         run: |
-          gh api "repos/${{ github.repository }}/actions/caches?key=ia-photos-$G-&per_page=100" --jq '.actions_caches[].key' | while read -r k; do
+          CLES=$(gh api "repos/${{ github.repository }}/actions/caches?key=ia-photos-$G-&per_page=100" --jq '.actions_caches[].key')
+          # Si la nouvelle copie n'a pas été enregistrée, on garde surtout les anciennes !
+          if ! echo "$CLES" | grep -qx "$CLE"; then echo "Copie des photos non enregistrée : anciennes copies gardées." | tee -a journal.txt; exit 0; fi
+          echo "$CLES" | while read -r k; do
             [ "$k" != "$CLE" ] && gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=$k" >/dev/null && echo "effacé : $k"
           done || true
 
@@ -224,7 +227,7 @@ jobs:
           touch journal.txt
           python3 - <<'PY'
           lignes = [l.rstrip() for l in open('journal.txt', errors='replace')]
-          garde = [l for l in lignes if l.startswith(('  -', '  !', 'Temps', 'Résultat', 'Modèle', 'Terminé', 'Traceback', 'Epoch', 'Vérification', 'Publié', 'Objectif', 'Collecte', 'Minutes', 'Entraînement', 'Reprise', 'Plus de progrès')) or 'Error' in l or 'espèces' in l or 'top1' in l]
+          garde = [l for l in lignes if l.startswith(('  -', '  !', 'Temps', 'Résultat', 'Modèle', 'Terminé', 'Traceback', 'Epoch', 'Vérification', 'Publié', 'Objectif', 'Collecte', 'Minutes', 'Repris', 'Copie', 'Entraînement', 'Reprise', 'Plus de progrès')) or 'Error' in l or 'espèces' in l or 'top1' in l or 'autre :' in l]
           t = '\n'.join(garde[-120:] + ['--- fin du journal ---'] + lignes[-40:])
           for i in range(0, min(len(t), 45000), 3000):
               m = t[i:i+3000].replace('%', '%25').replace('\r', '').replace('\n', '%0A')
