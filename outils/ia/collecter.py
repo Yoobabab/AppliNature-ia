@@ -54,6 +54,8 @@ GROUPES = {
         "inclure": [(g, "GENUS") for g in ARBRES],
         "autre": [("Fungi", "KINGDOM"), ("Magnoliopsida", "CLASS"), ("Bryophyta", "PHYLUM")],
         "autre_sans_genres": ARBRES,
+        # Doublons de nom : en France, le chêne à feuilles rondes est compté comme chêne vert (l'IA les mélangeait).
+        "exclure_especes": ["Quercus rotundifolia"],
     },
     "fleurs": {
         "inclure": [("Magnoliopsida", "CLASS"), ("Liliopsida", "CLASS")],
@@ -237,6 +239,8 @@ def main():
             try:
                 m = json.load(open(memo, encoding="utf-8"))
                 assez = m["demande"] >= a.par_espece or m["trouvees"] < m["demande"]
+                if m.get("fiche") and m["fiche"].get("latin") in g.get("exclure_especes", []):
+                    return None
                 if assez and m.get("fiche") is None:
                     compte["reprises"] += 1
                     return None
@@ -251,6 +255,8 @@ def main():
             return None
         info = get(f"{API}/species/{cle}")
         if info.get("rank") != "SPECIES" or info.get("taxonomicStatus") not in ("ACCEPTED", None):
+            return None
+        if info.get("canonicalName") in g.get("exclure_especes", []):
             return None
         if info.get("genus") in g.get("exclure_genres", []) or info.get("family") in g.get("exclure_familles", []):
             return None
