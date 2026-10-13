@@ -1,0 +1,30 @@
+# Petit outil : liste les copies gardées par le robot (photos, entraînements mis de côté)
+# et efface, si demandé, celles dont le nom commence par « effacer ».
+name: Copies du robot
+
+on:
+  workflow_dispatch:
+    inputs:
+      effacer:
+        description: Début du nom des copies à effacer (vide = rien)
+        default: ''
+
+jobs:
+  caches:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Lister et effacer
+        run: |
+          P="${{ inputs.effacer }}"
+          if [ -n "$P" ]; then
+            gh api "repos/${{ github.repository }}/actions/caches?key=$P&per_page=100" --jq '.actions_caches[].key' | while read -r k; do
+              gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=$k" >/dev/null && echo "::notice title=Effacé::$k"
+            done
+          fi
+          L=$(gh api "repos/${{ github.repository }}/actions/caches?per_page=100" --jq '.actions_caches[] | "\(.key) \(.size_in_bytes / 1e6 | floor) Mo, utilisé \(.last_accessed_at), créé \(.created_at)"' | tr '\n' '|')
+          echo "::notice title=Copies::$L"
+          echo "::notice title=Total::$(gh api "repos/${{ github.repository }}/actions/cache/usage" --jq '"\(.active_caches_size_in_bytes / 1e9) Go, \(.active_caches_count) copies"')"
